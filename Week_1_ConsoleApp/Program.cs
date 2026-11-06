@@ -1,16 +1,45 @@
-﻿using System.Net;
+﻿using ConsoleApp;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 internal class Program
 {
     private const string Scope = "GIGACHAT_API_PERS";
+
     private const string Model = "GigaChat-2";
+
+    private const int MaxToken = 1000;
+
+    private const bool ToJson = true;
+
+    private static readonly object ResponseFormat = new
+    {
+        type = "json_schema",
+        schema = new
+        {
+            type = "object",
+            properties = new
+            {
+                name = new { type = "string" },
+                year = new { type = "integer" },
+                purpose = new { type = "string" },
+                advantages = new { type = "array", items = new { type = "string" } },
+                disadvantages = new { type = "array", items = new { type = "string" } }
+            },
+            required = new[] { "name", "year", "purpose", "advantages", "disadvantages" },
+            additionalProperties = false
+        },
+        strict = true
+    };
+
 
     private static async Task Main()
     {
         string? authKey = Environment.GetEnvironmentVariable("GIGACHAT_AUTH_KEY");
+
         if (string.IsNullOrWhiteSpace(authKey))
         {
             Console.WriteLine("Нет переменной окружения GIGACHAT_AUTH_KEY (Authorization key).");
@@ -19,9 +48,7 @@ internal class Program
 
         using HttpClientHandler handler = new()
         {
-            // В корпсети/VPN может ломаться TLS. Для ДЗ можно оставить, но в проде убрать.
-            ServerCertificateCustomValidationCallback =
-                HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
+            ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
         };
 
         using HttpClient http = new(handler);
@@ -29,8 +56,7 @@ internal class Program
         // Получаем токен один раз на запуск (действует ~30 минут)
         string accessToken = await GetAccessTokenAsync(http, authKey);
 
-        List<object> history =
-        [
+        List<object> history = [
             new { role = "system", content = "Ты полезный ассистент. Отвечай не сильно много" }
         ];
 
@@ -63,20 +89,93 @@ internal class Program
 
             try
             {
-                string assistant = await ChatAsync(http, accessToken, history);
-                Console.WriteLine(assistant);
-                history.Add(new { role = "assistant", content = assistant });
+                await Output(http, accessToken, history, MaxToken, ToJson);
             }
             catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.Unauthorized)
             {
                 // Токен мог протухнуть — получим заново и повторим 1 раз
                 accessToken = await GetAccessTokenAsync(http, authKey);
 
-                string assistant = await ChatAsync(http, accessToken, history);
-                Console.WriteLine(assistant);
-                history.Add(new { role = "assistant", content = assistant });
+                await Output(http, accessToken, history, MaxToken, ToJson);
             }
         }
+    }
+
+    private static async Task Output(HttpClient http, string accessToken, List<object> history, int? maxTokens = null, bool toJson = false)
+    {
+        object? responseFormat = null;
+
+        if (toJson)
+        {
+            responseFormat = ResponseFormat;
+        }
+
+        ChatResult result = await ChatAsync(http, accessToken, history, maxTokens, responseFormat);
+
+        Console.WriteLine("\nОтвет модели:");
+        Console.WriteLine(result.Content);
+
+        Console.WriteLine("\n--- Статистика запроса ---");
+        Console.WriteLine($"Finish reason: {result.FinishReason}");
+        Console.WriteLine($"Prompt tokens: {result.PromptTokens}");
+        Console.WriteLine($"Completion tokens: {result.CompletionTokens}");
+        Console.WriteLine($"Total tokens: {result.TotalTokens}");
+
+        history.Add(new { role = "assistant", content = result.Content });
+
+        if (!toJson)
+        {
+            return;
+        }
+
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(result.Content);
+            Console.WriteLine("\nJSON успешно разобран!");
+        }
+        catch (JsonException ex)
+        {
+            Console.WriteLine($"\nОшибка JSON: {ex.Message}");
+        }
+
+        try
+        {
+            LanguageInfo? language = JsonSerializer.Deserialize<LanguageInfo>(
+                result.Content,
+                new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                });
+
+            if (language == null)
+            {
+                Console.WriteLine("\nНе удалось получить объект.");
+                return;
+            }
+
+            Console.WriteLine($"\nЯзык: {language.Name}");
+            Console.WriteLine($"Год: {language.Year}");
+            Console.WriteLine($"Назначение: {language.Purpose}");
+
+            Console.WriteLine("Преимущества:");
+            foreach (string item in language.Advantages)
+            {
+                Console.WriteLine($"- {item}");
+            }
+
+            Console.WriteLine("Недостатки:");
+            foreach (string item in language.Disadvantages)
+            {
+                Console.WriteLine($"- {item}");
+            }
+        }
+        catch (JsonException ex)
+        {
+            Console.WriteLine($"\nОшибка десериализации: {ex.Message}");
+        }
+
+
+
     }
 
     private static async Task<string> GetAccessTokenAsync(HttpClient http, string authKey)
@@ -104,32 +203,56 @@ internal class Program
                ?? throw new Exception("В ответе нет access_token");
     }
 
-    private static async Task<string> ChatAsync(HttpClient http, string accessToken, List<object> messages)
+    private static async Task<ChatResult> ChatAsync(HttpClient http, string accessToken, List<object> messages, int? maxTokens = null, object? responseFormat = null)
     {
         var body = new
         {
             model = Model,
-            messages
+            messages,
+            max_tokens = maxTokens,
+            response_format = responseFormat,
+            stop = new[] { "<END>" }
         };
 
-        using HttpRequestMessage req = new(HttpMethod.Post, "https://api.giga.chat/v1/chat/completions");
-        req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-        req.Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
-
-        HttpResponseMessage resp = await http.SendAsync(req);
-        string text = await resp.Content.ReadAsStringAsync();
-
-        if (!resp.IsSuccessStatusCode)
+        JsonSerializerOptions options = new()
         {
-            throw new HttpRequestException($"HTTP {(int)resp.StatusCode}\n{text}", null, resp.StatusCode);
-        }
+            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+        };
 
-        using JsonDocument doc = JsonDocument.Parse(text);
-        return doc.RootElement
-            .GetProperty("choices")[0]
-            .GetProperty("message")
-            .GetProperty("content")
-            .GetString() ?? text;
+        string json = JsonSerializer.Serialize(body, options);
+
+        using HttpRequestMessage request = new(
+            HttpMethod.Post,
+            "https://api.giga.chat/v1/chat/completions");
+
+        request.Headers.Authorization =
+            new AuthenticationHeaderValue("Bearer", accessToken);
+
+        request.Content = new StringContent(
+            json,
+            Encoding.UTF8,
+            "application/json");
+
+        using HttpResponseMessage response = await http.SendAsync(request);
+
+        string responseText = await response.Content.ReadAsStringAsync();
+
+        response.EnsureSuccessStatusCode();
+
+        using JsonDocument document = JsonDocument.Parse(responseText);
+
+        JsonElement root = document.RootElement;
+        JsonElement choice = root.GetProperty("choices")[0];
+        JsonElement message = choice.GetProperty("message");
+        JsonElement usage = root.GetProperty("usage");
+
+        return new ChatResult
+        {
+            Content = message.GetProperty("content").GetString() ?? "",
+            FinishReason = choice.GetProperty("finish_reason").GetString() ?? "unknown",
+            PromptTokens = usage.GetProperty("prompt_tokens").GetInt32(),
+            CompletionTokens = usage.GetProperty("completion_tokens").GetInt32(),
+            TotalTokens = usage.GetProperty("total_tokens").GetInt32()
+        };
     }
 }
